@@ -184,8 +184,10 @@ class PixivDom {
   removeBadge(node) {
     node.querySelector(".sc-45073218-9")?.remove();
   }
-  removeAds() {
+  removeAds(){
     document.querySelectorAll('[id^="adsdk"]')
+      .forEach(el => el.remove());
+    document.querySelectorAll('[class^="mb-16"]')
       .forEach(el => el.remove());
   }
   startAdGuard() {
