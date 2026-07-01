@@ -4,7 +4,14 @@ class Config{
         this.minPageCount=30;
         this.excludeAI=false;
         this.excludeTags=[
-            "ロリ","loli"
+            "ロリ",
+            "loli",
+            “ふたなり”,
+            “男の娘”,
+            “ショタ”, 
+            “ホモ”, 
+            “ゲイ”, 
+            “BL”
         ];
     }
 }
