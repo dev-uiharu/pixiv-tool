@@ -1,7 +1,9 @@
 // config.js
 class Config {
   constructor() {
-    this.minPageCount = 30;
+    this.minPageCount = 20;
+    this.minFavoriteCount = 50;
+    this.minViewCount = 300;
     this.excludeAI = false;
     this.excludeTags = [
       "ロリ",
@@ -11,8 +13,7 @@ class Config {
       "ショタ",
       "ホモ",
       "ゲイ",
-      "BL",
-      "アヘ顔"
+      "BL"
     ];
   }
 }
@@ -73,6 +74,48 @@ class SearchQuery {
 
 // pixiv-client.js
 class PixivClient {
+  constructor({
+    maxConcurrent = 2,
+    retryDelayMs = 400,
+    maxRetries = 2
+  } = {}) {
+    this.maxConcurrent = maxConcurrent;
+    this.retryDelayMs = retryDelayMs;
+    this.maxRetries = maxRetries;
+    this.activeRequests = 0;
+    this.queue = [];
+  }
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+  enqueue(task) {
+    return new Promise((resolve, reject) => {
+      const run = () => {
+        this.activeRequests += 1;
+        Promise.resolve()
+          .then(task)
+          .then(resolve, reject)
+          .finally(() => {
+            this.activeRequests -= 1;
+            this.runNext();
+          });
+      };
+      if (this.activeRequests < this.maxConcurrent) {
+        run();
+      } else {
+        this.queue.push(run);
+      }
+    });
+  }
+  runNext() {
+    if (this.queue.length === 0 || this.activeRequests >= this.maxConcurrent) {
+      return;
+    }
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    }
+  }
   createUrl(query) {
     const url = new URL(`https://www.pixiv.net/ajax/search/artworks/${encodeURIComponent(query.word)}`);
     url.searchParams.set("order", query.order);
@@ -134,36 +177,92 @@ class PixivClient {
         .map(item => this.normalizeWork(item))
     };
   }
+  async getWorkDetails(id) {
+    return this.enqueue(async () => {
+      for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+        try {
+          const response = await fetch(
+            `https://www.pixiv.net/touch/ajax/illust/details?illust_id=${id}`,
+            { credentials: "same-origin" }
+          );
+          if (!response.ok) {
+            if (response.status === 429 || response.status >= 500) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+            return { favoriteCount: '-', viewCount: '-' };
+          }
+          const json = await response.json();
+          const details = json.body?.illust_details ?? json.body ?? {};
+          return {
+            favoriteCount: Number(details.bookmark_user_total ?? 0),
+            viewCount: Number(String(details.rating_view ?? "0").replace(/[^0-9.-]/g, "")) || 0
+          };
+        } catch (error) {
+          if (attempt < this.maxRetries) {
+            await this.delay(this.retryDelayMs * (attempt + 1));
+            continue;
+          }
+          console.warn(`[pe] detail request failed for ${id}`, error);
+          return { favoriteCount: '-', viewCount: '-' };
+        }
+      }
+      return { favoriteCount: '-', viewCount: '-' };
+    });
+  }
 }
 
 // filter.js
 class Filter {
-  constructor(config) {
+  constructor(config, client) {
     this.config = config;
+    this.client = client;
   }
-  apply(works) {
-    return works.filter(work => this.accept(work));
+  async apply(works) {
+    const filtered = [];
+    for (const work of works) {
+      if (await this.accept(work)) {
+        filtered.push(work);
+      }
+    }
+    return filtered;
   }
-  accept(work) {
-    return this.ad(work)
-      && this.ai(work)
-      && this.pageCount(work)
-      && this.tags(work);
+  async accept(work) {
+    if (!this.isAdAllowed(work) ||
+      !this.isAiAllowed(work) ||
+      !this.meetsPageCount(work) ||
+      !this.isTagAllowed(work)) {
+      return false;
+    }
+    // return await this.hasMinimumCounts(work);
+    return true;
   }
-  ad(work) {
+  isAdAllowed(work) {
     return !work.isAd;
   }
-  ai(work) {
+  isAiAllowed(work) {
     if (!this.config.excludeAI) return true;
     return work.aiType !== 2;
   }
-  pageCount(work) {
+  meetsPageCount(work) {
     return work.pageCount >= this.config.minPageCount;
   }
-  tags(work) {
-    // console.log(work.tags);
+  isTagAllowed(work) {
     if (this.config.excludeTags.length === 0) return true;
-    return !work.tags.some(tag => this.config.excludeTags.includes(tag));
+    const tags = Array.isArray(work.tags) ? work.tags : [];
+    return !tags.some(tag => this.config.excludeTags.includes(tag));
+  }
+  async hasMinimumCounts(work) {
+    const details = await this.client.getWorkDetails(work.id);
+    work.favoriteCount = details.favoriteCount ?? '-';
+    work.viewCount = details.viewCount ?? '-';
+
+    if (this.config.minFavoriteCount > 0 && work.favoriteCount !== '-' && work.favoriteCount < this.config.minFavoriteCount) {
+      return false;
+    }
+    if (this.config.minViewCount > 0 && work.viewCount !== '-' && work.viewCount < this.config.minViewCount) {
+      return false;
+    }
+    return true;
   }
 }
 
@@ -186,7 +285,6 @@ class PixivDom {
     return node.querySelector("img");
   }
   getImageContainer(node) {
-    // return node.querySelector(".gutbuO");
     return node.querySelector("img")?.closest("div");
   }
   getPagination() {
@@ -196,9 +294,6 @@ class PixivDom {
   removePageCount(node) {
     node.querySelector(".sc-e414e6ba-16")?.remove();
   }
-  removeAiLabel(node) {
-    // node.querySelector(".sc-e414e6ba-15")?.remove();
-  }
   removeBadge(node) {
     node.querySelector(".sc-e414e6ba-9")?.remove();
   }
@@ -207,7 +302,8 @@ class PixivDom {
       .forEach(el => el.remove());
     document.querySelectorAll('[class^="mb-16"]')
       .forEach(el => el.remove());
-
+    document.querySelectorAll('.mt-36')
+      .forEach(el => el.remove());
   }
   startAdGuard() {
     this.removeAds();
@@ -237,7 +333,7 @@ class Renderer {
     this.updateLink(node, work);
     this.updateImage(node, work);
     this.cleanup(node);
-    this.addPageCount(node, work.pageCount);
+    this.addStats(node, work);
     return node;
   }
   updateLink(node, work) {
@@ -254,23 +350,32 @@ class Renderer {
     img.alt = work.alt;
   }
   cleanup(node) {
-    this.dom.removeAiLabel(node);
     this.dom.removePageCount(node);
     this.dom.removeBadge(node);
   }
-  addPageCount(node, pageCount) {
+  addStats(node, work) {
     const container = this.dom.getImageContainer(node);
     if (!container) return;
+    container.style.position = "relative";
+    container.style.display = "block";
+    container.style.overflow = "hidden";
     let overlay = container.querySelector(".pe-overlay");
     if (!overlay) {
       overlay = document.createElement("div");
       overlay.className = "pe-overlay";
       container.appendChild(overlay);
     }
-    const page = document.createElement("div");
-    page.className = "pe-page";
-    page.textContent = pageCount;
-    overlay.appendChild(page);
+    overlay.replaceChildren();
+    this.appendStat(overlay, "page", `📖 ${Number(work.pageCount ?? 0).toLocaleString()}`, "ページ数");
+    this.appendStat(overlay, "favorite", `♥ ${work.favoriteCount ?? '-'}`, "お気に入り数");
+    this.appendStat(overlay, "view", `👁 ${work.viewCount ?? '-'}`, "閲覧回数");
+  }
+  appendStat(overlay, kind, text, label) {
+    const stat = document.createElement("div");
+    stat.className = `pe-stat pe-stat--${kind}`;
+    stat.setAttribute("title", label);
+    stat.textContent = text;
+    overlay.appendChild(stat);
   }
   append(work) {
     this.grid.appendChild(this.create(work));
@@ -289,17 +394,7 @@ class Renderer {
       el.className = "pe-loading";
       el.hidden = true;
       el.textContent = "⏳ 次ページを読み込み中...";
-      // const reference = document.querySelector(".pe-progress") || document.body;
-      // reference.appendChild(el);
-      const progress = document.querySelector(".pe-progress");
-      const anchor = progress || this.dom.getPagination() || document.body;
-      if (progress) {
-        progress.before(el);
-      } else if (anchor.before) {
-        anchor.before(el);
-      } else {
-        anchor.appendChild(el);
-      }
+      this.insertElement(el, ".pe-progress", ".pe-loading");
     }
     return el;
   }
@@ -308,18 +403,27 @@ class Renderer {
     if (!el) {
       el = document.createElement("div");
       el.className = "pe-progress";
-      // this.dom.getPagination()?.before(el);
-      const loading = document.querySelector(".pe-loading");
-      const anchor = loading || this.dom.getPagination() || document.body;
-      if (loading) {
-        loading.after(el);
-      } else if (anchor.before) {
-        anchor.before(el);
-      } else {
-        anchor.appendChild(el);
-      }
+      this.insertElement(el, ".pe-progress", ".pe-loading");
     }
     return el;
+  }
+  insertElement(el, beforeSelector, afterSelector) {
+    const beforeTarget = document.querySelector(beforeSelector);
+    const afterTarget = document.querySelector(afterSelector);
+    if (beforeTarget) {
+      beforeTarget.before(el);
+      return;
+    }
+    if (afterTarget) {
+      afterTarget.after(el);
+      return;
+    }
+    const anchor = this.dom.getPagination() || document.body;
+    if (anchor.before) {
+      anchor.before(el);
+    } else {
+      anchor.appendChild(el);
+    }
   }
   showLoading() {
     this.getLoadingElement().hidden = false;
@@ -344,6 +448,7 @@ class Pager {
     this.currentPage = query.page - 1;
     this.lastPage = Infinity;
     this.loading = false;
+    this.loadingPage = null;
     this.loadedIds = new Set();
     this.pagination = null;
     this.scrollHandler = null;
@@ -356,24 +461,32 @@ class Pager {
     return this.baseQuery.clone({ page });
   }
   async load(page) {
-    const result = await this.client.search(this.createQuery(page));
-    this.lastPage = result.lastPage;
-    const works = this.filter.apply(result.works).filter(work => {
-      if (this.loadedIds.has(work.id)) return false;
-      this.loadedIds.add(work.id);
-      return true;
-    });
-    this.renderer.appendAll(works);
-    this.currentPage = page;
-    this.renderer.updateProgress(
-      this.currentPage,
-      this.lastPage
-    );
-    // ページネーションを再取得（SPA対策）
-    this.pagination = this.dom.getPagination();
-    // 描画後もページネーションが見えているなら続けて取得
-    this.handleScroll();
-    console.log(`Page ${page}: ${works.length}/${result.works.length}`);
+    if (this.loading || page > this.lastPage) return;
+    this.loading = true;
+    this.loadingPage = page;
+    this.renderer.showLoading();
+    try {
+      const result = await this.client.search(this.createQuery(page));
+      if (this.loadingPage !== page) return;
+      this.lastPage = result.lastPage;
+      const works = (await this.filter.apply(result.works)).filter(work => {
+        if (this.loadedIds.has(work.id)) return false;
+        this.loadedIds.add(work.id);
+        return true;
+      });
+      this.renderer.appendAll(works);
+      this.currentPage = page;
+      this.renderer.updateProgress(
+        this.currentPage,
+        this.lastPage
+      );
+      this.pagination = this.dom.getPagination();
+      this.handleScroll();
+    } finally {
+      this.renderer.hideLoading();
+      this.loading = false;
+      this.loadingPage = null;
+    }
   }
   async loadCurrent() {
     this.renderer.clear();
@@ -383,28 +496,15 @@ class Pager {
     await this.load(this.currentPage + 1);
   }
   async loadNext() {
-    if (this.loading) return;
     if (this.currentPage >= this.lastPage) return;
-    this.loading = true;
-    this.renderer.showLoading();
-    try {
-      await this.load(this.currentPage + 1);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      this.renderer.hideLoading();
-      this.loading = false;
-    }
+    await this.load(this.currentPage + 1);
   }
   handleScroll() {
-    if (this.loading) return;
-    if (this.currentPage >= this.lastPage) return;
-    if (!this.pagination) {
-      this.pagination = this.dom.getPagination();
-      if (!this.pagination) return;
-    }
+    if (this.loading || this.currentPage >= this.lastPage) return;
+    const pagination = this.pagination || this.dom.getPagination();
+    if (!pagination) return;
+    this.pagination = pagination;
     const rect = this.pagination.getBoundingClientRect();
-    // ページネーションが画面内に入ったら次ページ取得
     if (rect.top <= window.innerHeight && rect.bottom >= 0) {
       this.loadNext();
     }
@@ -421,7 +521,6 @@ class Pager {
     window.addEventListener("scroll", this.scrollHandler, {
       passive: true
     });
-    // 初回も判定
     this.handleScroll();
   }
 }
@@ -433,34 +532,41 @@ function injectStyle() {
   style.id = "pe-style";
   style.textContent = `
 .pe-overlay{
-position:absolute;
-top:4px;
-right:4px;
-display:flex;
-flex-direction:column;
-align-items:flex-end;
-gap:2px;
-z-index:999;
-pointer-events:none;
+  position:absolute;
+  top:2px;
+  right:2px;
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:2px;
+  z-index:999;
+  pointer-events:none;
 }
-.pe-page{
-padding:2px 6px;
-background:rgba(0,0,0,.8);
-color:#fff;
-font-size:12px;
-font-weight:bold;
-line-height:1;
-border-radius:4px;
+.pe-stat{
+  display:flex;
+  align-items:center;
+  gap:4px;
+  background:rgba(0,0,0,.6);
+  color:#fff;
+  font-size:10px;
+  font-weight:bold;
+  line-height:1;
+  border-radius:4px;
+  white-space:nowrap;
+}
+.pe-stat--favorite{
+  color:#ff7ea8;
+}
+.pe-stat--view{
+  color:#7ec8ff;
 }
 .pe-loading,
 .pe-progress{
-margin:12px 0;
-text-align:center;
-font-size:14px;
-color:#666;
-}
-.pe-loading{
-font-weight:bold;
+  margin:12px 0;
+  text-align:center;
+  font-size:14px;
+  color:#666;
+  font-weight:bold;
 }`;
   document.head.appendChild(style);
 }
@@ -469,8 +575,12 @@ font-weight:bold;
   const config = new Config();
   const dom = new PixivDom();
   const query = SearchQuery.fromLocation();
-  const client = new PixivClient();
-  const filter = new Filter(config);
+  const client = new PixivClient({
+    maxConcurrent: 1,
+    retryDelayMs: 500,
+    maxRetries: 2
+  });
+  const filter = new Filter(config, client);
   const renderer = new Renderer(dom);
   const pager = new Pager(query, client, filter, renderer, dom);
   dom.startAdGuard();
