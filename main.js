@@ -76,7 +76,7 @@ class SearchQuery {
 class PixivClient {
   constructor({
     maxConcurrent = 2,
-    retryDelayMs = 400,
+    retryDelayMs = 1000,
     maxRetries = 2
   } = {}) {
     this.maxConcurrent = maxConcurrent;
