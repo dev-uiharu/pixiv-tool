@@ -3,7 +3,7 @@ class Config {
   constructor() {
     this.minPageCount = 20;
     this.minFavoriteCount = 50;
-    this.minViewCount = 300;
+    this.minViewCount = 500;
     this.excludeAI = false;
     this.excludeTags = [
       "ロリ",
@@ -13,7 +13,8 @@ class Config {
       "ショタ",
       "ホモ",
       "ゲイ",
-      "BL"
+      "BL",
+      "リョナ"
     ];
   }
 }
@@ -75,46 +76,37 @@ class SearchQuery {
 // pixiv-client.js
 class PixivClient {
   constructor({
-    maxConcurrent = 2,
     retryDelayMs = 400,
-    maxRetries = 2
+    maxRetries = 0,
+    requestIntervalMs = 200
   } = {}) {
-    this.maxConcurrent = maxConcurrent;
     this.retryDelayMs = retryDelayMs;
     this.maxRetries = maxRetries;
-    this.activeRequests = 0;
-    this.queue = [];
+    this.requestIntervalMs = requestIntervalMs;
+    // 次回リクエスト可能時刻
+    this.nextRequestTime = performance.now();
+    // シリアル実行キュー
+    this.requestQueue = Promise.resolve();
   }
   delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
-  enqueue(task) {
-    return new Promise((resolve, reject) => {
-      const run = () => {
-        this.activeRequests += 1;
-        Promise.resolve()
-          .then(task)
-          .then(resolve, reject)
-          .finally(() => {
-            this.activeRequests -= 1;
-            this.runNext();
-          });
-      };
-      if (this.activeRequests < this.maxConcurrent) {
-        run();
-      } else {
-        this.queue.push(run);
-      }
-    });
+  async waitForInterval() {
+    const now = performance.now();
+    if (this.nextRequestTime > now) {
+      await this.delay(this.nextRequestTime - now);
+    }
+    // 次回開始可能時刻を更新
+    this.nextRequestTime = performance.now() + this.requestIntervalMs;
   }
-  runNext() {
-    if (this.queue.length === 0 || this.activeRequests >= this.maxConcurrent) {
-      return;
-    }
-    const next = this.queue.shift();
-    if (next) {
-      next();
-    }
+  enqueue(task) {
+    const promise = this.requestQueue.then(async () => {
+      await this.waitForInterval();
+      return task();
+    });
+    // エラーでもキューが止まらないようにする
+    this.requestQueue = promise.catch(() => { });
+    return promise;
   }
   createUrl(query) {
     const url = new URL(`https://www.pixiv.net/ajax/search/artworks/${encodeURIComponent(query.word)}`);
@@ -179,34 +171,47 @@ class PixivClient {
   }
   async getWorkDetails(id) {
     return this.enqueue(async () => {
-      for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+      for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
         try {
           const response = await fetch(
             `https://www.pixiv.net/touch/ajax/illust/details?illust_id=${id}`,
-            { credentials: "same-origin" }
+            {
+              credentials: "omit"
+            }
           );
           if (!response.ok) {
             if (response.status === 429 || response.status >= 500) {
               throw new Error(`HTTP ${response.status}`);
             }
-            return { favoriteCount: '-', viewCount: '-' };
+            return {
+              favoriteCount: "-",
+              viewCount: "-"
+            };
           }
           const json = await response.json();
           const details = json.body?.illust_details ?? json.body ?? {};
           return {
             favoriteCount: Number(details.bookmark_user_total ?? 0),
-            viewCount: Number(String(details.rating_view ?? "0").replace(/[^0-9.-]/g, "")) || 0
+            viewCount:
+              Number(
+                String(details.rating_view ?? "0").replace(/[^0-9.-]/g, "")
+              ) || 0
           };
         } catch (error) {
           if (attempt < this.maxRetries) {
             await this.delay(this.retryDelayMs * (attempt + 1));
             continue;
           }
-          console.warn(`[pe] detail request failed for ${id}`, error);
-          return { favoriteCount: '-', viewCount: '-' };
+          return {
+            favoriteCount: "-",
+            viewCount: "-"
+          };
         }
       }
-      return { favoriteCount: '-', viewCount: '-' };
+      return {
+        favoriteCount: "-",
+        viewCount: "-"
+      };
     });
   }
 }
@@ -233,8 +238,7 @@ class Filter {
       !this.isTagAllowed(work)) {
       return false;
     }
-    // return await this.hasMinimumCounts(work);
-    return true;
+    return await this.hasMinimumCounts(work);
   }
   isAdAllowed(work) {
     return !work.isAd;
@@ -562,7 +566,7 @@ function injectStyle() {
 }
 .pe-loading,
 .pe-progress{
-  margin:12px 0;
+  margin:4px 0;
   text-align:center;
   font-size:14px;
   color:#666;
@@ -578,7 +582,7 @@ function injectStyle() {
   const client = new PixivClient({
     maxConcurrent: 1,
     retryDelayMs: 500,
-    maxRetries: 2
+    maxRetries: 0
   });
   const filter = new Filter(config, client);
   const renderer = new Renderer(dom);
