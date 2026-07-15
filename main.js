@@ -2,8 +2,8 @@
 class Config {
   constructor() {
     this.minPageCount = 20;
-    this.minFavoriteCount = 50;
-    this.minViewCount = 500;
+    this.minFavoriteCount = 0;
+    this.minViewCount = 1000;
     this.excludeAI = false;
     this.excludeTags = [
       "ロリ",
@@ -14,7 +14,10 @@ class Config {
       "ホモ",
       "ゲイ",
       "BL",
-      "リョナ"
+      "リョナ",
+      "ボテ腹",
+      "爆乳",
+      "おねショタ"
     ];
   }
 }
