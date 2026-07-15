@@ -311,6 +311,10 @@ class PixivDom {
       .forEach(el => el.remove());
     document.querySelectorAll('.mt-36')
       .forEach(el => el.remove());
+    document.querySelectorAll('div[style^="display: block"]')
+      .forEach(e => e.remove());
+    document.querySelectorAll('div[class="w-full"]').
+      forEach(div => div.remove());
   }
   startAdGuard() {
     this.removeAds();
