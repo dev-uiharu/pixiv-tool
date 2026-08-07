@@ -311,6 +311,10 @@ class PixivDom {
       .forEach(el => el.remove());
     document.querySelectorAll('.mt-36')
       .forEach(el => el.remove());
+    document.querySelectorAll('div[style^="display: block"]')
+      .forEach(e => e.remove());
+    document.querySelectorAll('div[class="w-full"]').
+      forEach(div => div.remove());
   }
   startAdGuard() {
     this.removeAds();
@@ -532,6 +536,218 @@ class Pager {
   }
 }
 
+// selection-overlay.js
+class SelectionOverlay {
+  constructor({
+    options = [
+      { label: "minPageCount", values: ["5", "10", "20"] },
+      { label: "minViewCount", values: ["100", "1000", "10000"] }
+    ],
+    timeoutMs = 3000,
+    swipeStep = 30,
+    onSelect = null,
+    onComplete = null
+  } = {}) {
+    this.options = options;
+    this.timeoutMs = timeoutMs;
+    this.swipeStep = swipeStep;
+    this.onSelect = onSelect;
+    this.onComplete = onComplete;
+    this.state = {
+      isSelectable: true,
+      timeoutId: null
+    };
+    this.startX = 0;
+    this.oldDistance = 0;
+    this.overlay = null;
+    // キャッシュ保存時のキー接頭辞 (設定項目名と被らないように)
+    this.storagePrefix = "pixiv_filter_";
+    // 1. 各項目の選択インデックスを配列で管理 (キャッシュから読み込み)
+    this.currentIndices = this.options.map(option => {
+      try {
+        const cachedValue = localStorage.getItem(this.storagePrefix + option.label);
+        const idx = option.values.indexOf(cachedValue);
+        // キャッシュが存在し、かつ現在の選択肢に含まれている場合はその値、それ以外は0(一番左)
+        return idx !== -1 ? idx : 0;
+      } catch (e) {
+        return 0; // LocalStorageアクセス不可時は安全に0
+      }
+    });
+    // 2. 全パラメータの組み合わせ総数を計算
+    this.totalCombos = this.options.reduce((acc, opt) => acc * opt.values.length, 1);
+    // 3. 現在の総合インデックスを計算
+    this.currentIndex = this.calcGlobalIndex(this.currentIndices);
+    this.touchStartHandler = this.handleTouchStart.bind(this);
+    this.touchMoveHandler = this.handleTouchMove.bind(this);
+  }
+  // 各オプションのインデックスから、全体の総合インデックスを計算
+  calcGlobalIndex(indices) {
+    let globalIdx = 0;
+    let multiplier = 1;
+    for (let i = 0; i < this.options.length; i++) {
+      globalIdx += indices[i] * multiplier;
+      multiplier *= this.options[i].values.length;
+    }
+    return globalIdx;
+  }
+  // 総合インデックスから各オプションの値を計算し、UIのみを更新
+  applyGlobalIndex(globalIdx) {
+    // JavaScriptの仕様上、負の余りを正しく処理するための計算
+    this.currentIndex = ((globalIdx % this.totalCombos) + this.totalCombos) % this.totalCombos; 
+    let temp = this.currentIndex;
+    for (let i = 0; i < this.options.length; i++) {
+      const count = this.options[i].values.length;
+      const idx = temp % count;
+      this.currentIndices[i] = idx;
+      const label = this.options[i].label;
+      const value = this.options[i].values[idx];
+      // UIの更新
+      if (this.overlay) {
+        this.overlay.querySelectorAll(`button[data-label="${label}"]`).forEach(btn => {
+          const isActive = btn.dataset.value === String(value);
+          if (isActive) {
+            btn.classList.add('pe-btn-active');
+            btn.classList.remove('pe-btn-inactive');
+          } else {
+            btn.classList.add('pe-btn-inactive');
+            btn.classList.remove('pe-btn-active');
+          }
+        });
+      }
+      // 次の桁（次のパラメータ）へ
+      temp = Math.floor(temp / count);
+    }
+    if (this.onSelect) {
+      this.onSelect(this.getSelection());
+    }
+  }
+  // キャッシュへ一括保存
+  saveToCache() {
+    this.options.forEach((opt, i) => {
+      const value = opt.values[this.currentIndices[i]];
+      try {
+        localStorage.setItem(this.storagePrefix + opt.label, value);
+      } catch (e) {
+        // プライベートモード等でのエラー回避
+      }
+    });
+  }
+  getSelection() {
+    const selected = {};
+    this.options.forEach((opt, i) => {
+      selected[opt.label] = opt.values[this.currentIndices[i]];
+    });
+    return { selected };
+  }
+  // 共通クラスのスタイル定義
+  injectOverlayStyle() {
+    if (document.getElementById("pe-overlay-style")) return;
+    const style = document.createElement("style");
+    style.id = "pe-overlay-style";
+    style.textContent = `
+      #view-filter-overlay {
+        all: initial; position: fixed; top: 0; left: 0;
+        width: 100vw; height: 100vh; background: rgba(0, 0, 0, 0.6);
+        display: flex; flex-direction: column;
+        justify-content: center; align-items: center;
+        z-index: 2147483647; font-family: sans-serif;
+      }
+      .pe-btn-row {
+        all: initial; display: grid; gap: 8px; margin: 10px 0;
+        width: min(420px, calc(100vw - 40px));
+      }
+      .pe-btn {
+        all: initial; padding: 10px 20px; color: white;
+        border-radius: 8px; font-size: 16px; font-weight: bold;
+        cursor: pointer; transition: background 0.2s ease;
+        border: none; text-align: center;
+      }
+      .pe-btn-active { background: grey; }
+      .pe-btn-inactive { background: lightgrey; }
+    `;
+    document.head.appendChild(style);
+  }
+  createOverlay() {
+    this.injectOverlayStyle();
+    const overlay = document.createElement("div");
+    overlay.id = "view-filter-overlay";
+    this.options.forEach((opt, i) => {
+      const container = document.createElement("div");
+      container.className = "pe-btn-row";
+      // 選択肢の数に応じて自動で列の幅を分割
+      container.style.gridTemplateColumns = `repeat(${opt.values.length}, minmax(0, 1fr))`;
+      const selectedIdx = this.currentIndices[i];
+      opt.values.forEach((value, idx) => {
+        const button = document.createElement("button");
+        button.innerText = value;
+        button.dataset.label = opt.label;
+        button.dataset.value = value;
+        button.className = `pe-btn ${idx === selectedIdx ? 'pe-btn-active' : 'pe-btn-inactive'}`;
+        // タップでも直接選択可能にする
+        button.addEventListener("click", () => {
+          this.currentIndices[i] = idx;
+          this.currentIndex = this.calcGlobalIndex(this.currentIndices);
+          this.applyGlobalIndex(this.currentIndex);
+          this.resetTimeout();
+        });
+        container.appendChild(button);
+      });
+      overlay.appendChild(container);
+    });
+    document.documentElement.appendChild(overlay);
+    this.overlay = overlay;
+    return overlay;
+  }
+  resetTimeout() {
+    clearTimeout(this.state.timeoutId);
+    this.state.timeoutId = setTimeout(() => {
+      this.state.isSelectable = false;
+      this.saveToCache(); // ★ 確定したタイミングで1回だけ一括保存
+      this.destroy();
+      if (this.onComplete) {
+        this.onComplete(this.getSelection());
+      }
+    }, this.timeoutMs);
+  }
+  handleTouchStart(event) {
+    this.startX = event.touches[0].pageX;
+  }
+  handleTouchMove(event) {
+    if (!this.state.isSelectable) return;
+    const dx = event.changedTouches[0].pageX - this.startX;
+    const dist = Math.floor(dx / this.swipeStep);  
+    if (dist !== this.oldDistance) {
+      const diff = dist - this.oldDistance; // 右なら+1、左なら-1
+      this.applyGlobalIndex(this.currentIndex + diff);
+      this.oldDistance = dist;
+      this.resetTimeout();
+    }
+  }
+  bindEvents() {
+    window.addEventListener("touchstart", this.touchStartHandler, { passive: true });
+    window.addEventListener("touchmove", this.touchMoveHandler, { passive: true });
+  }
+  unbindEvents() {
+    window.removeEventListener("touchstart", this.touchStartHandler);
+    window.removeEventListener("touchmove", this.touchMoveHandler);
+  }
+  start() {
+    if (this.overlay) return;
+    this.createOverlay();
+    this.bindEvents();
+    this.resetTimeout();
+  }
+  destroy() {
+    clearTimeout(this.state.timeoutId);
+    this.unbindEvents();
+    this.state.isSelectable = false;
+    if (this.overlay) {
+      this.overlay.remove();
+      this.overlay = null;
+    }
+  }
+}
+
 // main.js
 function injectStyle() {
   if (document.getElementById("pe-style")) return;
@@ -577,13 +793,20 @@ function injectStyle() {
 }`;
   document.head.appendChild(style);
 }
-(async () => {
+function applyPreset(config, selection) {
+  const selected = selection?.selected ?? {};
+  if (selected.minPageCount != null) {
+    config.minPageCount = Number(selected.minPageCount);
+  }
+  if (selected.minViewCount != null) {
+    config.minViewCount = Number(selected.minViewCount);
+  }
+}
+function startMain(config) {
   injectStyle();
-  const config = new Config();
   const dom = new PixivDom();
   const query = SearchQuery.fromLocation();
   const client = new PixivClient({
-    maxConcurrent: 1,
     retryDelayMs: 500,
     maxRetries: 0
   });
@@ -592,8 +815,7 @@ function injectStyle() {
   const pager = new Pager(query, client, filter, renderer, dom);
   dom.startAdGuard();
   pager.init();
-  await pager.loadCurrent();
-  pager.start();
+  pager.loadCurrent().then(() => pager.start());
   window.pixiv = {
     config,
     query,
@@ -602,4 +824,24 @@ function injectStyle() {
     renderer,
     pager
   };
+}
+// main.js (ファイルの末尾部分)
+(async () => {
+  const config = new Config();
+  const selector = new SelectionOverlay({
+    options: [
+      { label: "minPageCount", values: ["5", "10", "20"] },
+      { label: "minViewCount", values: ["100", "1000", "10000"] }
+    ],
+    onSelect: (selection) => {
+      applyPreset(config, selection);
+    },
+    onComplete: (selection) => {
+      applyPreset(config, selection);
+      console.log("minPageCount:", config.minPageCount);
+      console.log("minViewCount:", config.minViewCount);
+      startMain(config);
+    }
+  });
+  selector.start();
 })();
