@@ -17,7 +17,9 @@ class Config {
       "リョナ",
       "ボテ腹",
       "爆乳",
-      "おねショタ"
+      "おねショタ",
+      "創作BL",
+      "ボーイズラブ漫画"
     ];
   }
 }
@@ -215,6 +217,32 @@ class PixivClient {
         favoriteCount: "-",
         viewCount: "-"
       };
+    });
+  }
+  // ディスカバリー用：詳細情報取得（キュー＆レート制限適用）
+  async getIllustFullInfo(id) {
+    return this.enqueue(async () => {
+      try {
+        const res = await fetch(`https://www.pixiv.net/ajax/illust/${id}`, {
+          credentials: "omit"
+        });
+        if (!res.ok) return null;
+        const json = await res.json();
+        if (json.error) return null;
+
+        const body = json.body;
+        return {
+          id: body.id,
+          title: body.title ?? "無題",
+          pageCount: body.pageCount ?? 1,
+          viewCount: body.viewCount ?? 0,
+          favoriteCount: body.bookmarkCount ?? 0,
+          aiType: body.aiType ?? 0,
+          tags: body.tags?.tags?.map(t => t.tag) || []
+        };
+      } catch (e) {
+        return null;
+      }
     });
   }
 }
@@ -593,7 +621,7 @@ class SelectionOverlay {
   // 総合インデックスから各オプションの値を計算し、UIのみを更新
   applyGlobalIndex(globalIdx) {
     // JavaScriptの仕様上、負の余りを正しく処理するための計算
-    this.currentIndex = ((globalIdx % this.totalCombos) + this.totalCombos) % this.totalCombos; 
+    this.currentIndex = ((globalIdx % this.totalCombos) + this.totalCombos) % this.totalCombos;
     let temp = this.currentIndex;
     for (let i = 0; i < this.options.length; i++) {
       const count = this.options[i].values.length;
@@ -715,7 +743,7 @@ class SelectionOverlay {
   handleTouchMove(event) {
     if (!this.state.isSelectable) return;
     const dx = event.changedTouches[0].pageX - this.startX;
-    const dist = Math.floor(dx / this.swipeStep);  
+    const dist = Math.floor(dx / this.swipeStep);
     if (dist !== this.oldDistance) {
       const diff = dist - this.oldDistance; // 右なら+1、左なら-1
       this.applyGlobalIndex(this.currentIndex + diff);
@@ -744,6 +772,75 @@ class SelectionOverlay {
     if (this.overlay) {
       this.overlay.remove();
       this.overlay = null;
+    }
+  }
+}
+
+// discovery-runner.js (追加分)
+class DiscoveryRunner {
+  constructor(config, client, filter, renderer) {
+    this.config = config;
+    this.client = client;
+    this.filter = filter;
+    this.renderer = renderer;
+    this.processedAttr = "data-custom-filtered";
+    this.intervalMs = 3000;
+    this.isProcessing = false;
+  }
+  getCardContainer(artLink) {
+    return artLink.closest('.works-item')
+      || artLink.closest('[class*="works-item"]')
+      || artLink.parentElement;
+  }
+  accept(work) {
+    if (!work) return false;
+    if (!this.filter.isAiAllowed(work)) return false;
+    if (!this.filter.meetsPageCount(work)) return false;
+    if (!this.filter.isTagAllowed(work)) return false;
+    if (this.config.minViewCount > 0 && work.viewCount < this.config.minViewCount) return false;
+    if (this.config.minFavoriteCount > 0 && work.favoriteCount < this.config.minFavoriteCount) return false;
+    return true;
+  }
+  applyDiscoveryStats(card, work) {
+    this.renderer.addStats(card, work);
+    const img = card.querySelector('img');
+    const container = img?.closest('div');
+    if (!container) return;
+    const overlay = container.querySelector(".pe-overlay");
+    if (!overlay) return;
+    overlay.classList.add("pe-overlay--discovery");
+    const pageStat = overlay.querySelector(".pe-stat--page");
+    if (pageStat) pageStat.remove();
+  }
+  start() {
+    console.log("🚀 [Discovery] ディスカバリー専用フィルターを開始しました");
+    injectStyle();
+    injectDiscoveryStyle();
+    this.loop();
+    setInterval(() => this.loop(), this.intervalMs);
+  }
+  async loop() {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+    try {
+      const links = document.querySelectorAll(`a[href*="/artworks/"]:not([${this.processedAttr}])`);
+      if (links.length === 0) return;
+      for (const link of links) {
+        const card = this.getCardContainer(link);
+        if (!card || card.hasAttribute(this.processedAttr)) continue;
+        link.setAttribute(this.processedAttr, "true");
+        card.setAttribute(this.processedAttr, "true");
+        const id = link.href.match(/\/artworks\/(\d+)/)?.[1];
+        if (!id) continue;
+        const work = await this.client.getIllustFullInfo(id);
+        if (!this.accept(work)) {
+          card.style.display = "none";
+        } else if (work) {
+          this.applyDiscoveryStats(card, work);
+        }
+      }
+    } finally {
+      this.isProcessing = false;
     }
   }
 }
@@ -793,6 +890,22 @@ function injectStyle() {
 }`;
   document.head.appendChild(style);
 }
+function injectDiscoveryStyle() {
+  if (document.getElementById("pe-discovery-style")) return;
+  const style = document.createElement("style");
+  style.id = "pe-discovery-style";
+  style.textContent = `
+.pe-overlay--discovery {
+  top: 20px !important; /* 標準ページ数バッジの下へ配置 */
+  right: 4px !important;
+}
+.pe-overlay--discovery .pe-stat {
+  font-size: 10px !important; /* フォントサイズを少し拡大 */
+  padding: 3px 6px !important;
+}
+`;
+  document.head.appendChild(style);
+}
 function applyPreset(config, selection) {
   const selected = selection?.selected ?? {};
   if (selected.minPageCount != null) {
@@ -804,26 +917,29 @@ function applyPreset(config, selection) {
 }
 function startMain(config) {
   injectStyle();
-  const dom = new PixivDom();
-  const query = SearchQuery.fromLocation();
-  const client = new PixivClient({
-    retryDelayMs: 500,
-    maxRetries: 0
-  });
+  const client = new PixivClient({ retryDelayMs: 500, maxRetries: 0 });
   const filter = new Filter(config, client);
-  const renderer = new Renderer(dom);
-  const pager = new Pager(query, client, filter, renderer, dom);
+  const dom = new PixivDom();
   dom.startAdGuard();
-  pager.init();
-  pager.loadCurrent().then(() => pager.start());
-  window.pixiv = {
-    config,
-    query,
-    client,
-    filter,
-    renderer,
-    pager
-  };
+  if (isDiscoveryPage()) {
+    // ディスカバリー画面用
+    const renderer = Object.create(Renderer.prototype);
+    renderer.dom = dom;
+    const runner = new DiscoveryRunner(config, client, filter, renderer);
+    runner.start();
+  } else {
+    // 検索画面用
+    const renderer = new Renderer(dom);
+    const query = SearchQuery.fromLocation();
+    const pager = new Pager(query, client, filter, renderer, dom);
+    pager.init();
+    pager.loadCurrent().then(() => pager.start());
+    window.pixiv = { config, query, client, filter, renderer, pager };
+  }
+}
+// URL判定用のヘルパー
+function isDiscoveryPage() {
+  return location.pathname.includes('/discovery');
 }
 // main.js (ファイルの末尾部分)
 (async () => {
@@ -838,8 +954,6 @@ function startMain(config) {
     },
     onComplete: (selection) => {
       applyPreset(config, selection);
-      console.log("minPageCount:", config.minPageCount);
-      console.log("minViewCount:", config.minViewCount);
       startMain(config);
     }
   });
